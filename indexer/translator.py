@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,8 @@ _LOCAL_API_KEY = "sk-local"
 _MODEL = "qwen2.5"          # model name as registered in the local server
 
 
-def _build_client() -> OpenAI:
-    return OpenAI(base_url=_LOCAL_BASE_URL, api_key=_LOCAL_API_KEY)
+def _build_client() -> AsyncOpenAI:
+    return AsyncOpenAI(base_url=_LOCAL_BASE_URL, api_key=_LOCAL_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ Convert the following HTML fragment to Markdown:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def translate_html_to_markdown(html_chunks: Sequence[str]) -> str:
+async def translate_html_to_markdown(html_chunks: Sequence[str]) -> str:
     """
     Translate one or more HTML chunks to Markdown and concatenate the results.
 
@@ -99,16 +99,16 @@ def translate_html_to_markdown(html_chunks: Sequence[str]) -> str:
 
     for i, chunk in enumerate(html_chunks):
         logger.debug("Translating HTML chunk %d/%d …", i + 1, len(html_chunks))
-        markdown = _call_llm(client, chunk)
+        markdown = await _call_llm(client, chunk)
         parts.append(markdown)
 
     return "\n\n".join(parts)
 
 
-def _call_llm(client: OpenAI, html: str) -> str:
+async def _call_llm(client: AsyncOpenAI, html: str) -> str:
     """Single LLM call: HTML in → Markdown out."""
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
