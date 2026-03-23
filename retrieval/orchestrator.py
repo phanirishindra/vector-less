@@ -49,9 +49,38 @@ def _stream_hide_think(stream: Iterator) -> Generator[str, None, None]:
     """
     Consume a streaming completion and yield tokens visible to the user,
     suppressing any content inside ``<think>…</think>`` tags.
+
+    Handles tags split across chunk boundaries correctly by holding back any
+    partial tag prefix until the next chunk confirms whether it is a real tag.
     """
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
     inside_think = False
     buffer = ""
+
+    def _safe_end_outside(buf: str) -> int:
+        """Return the index up to which it is safe to yield when outside a think block.
+
+        If ``buf`` ends with a partial prefix of ``<think>`` (e.g. ``<th``), the
+        prefix is held back so it is not emitted prematurely — the next chunk may
+        complete the tag and trigger suppression.
+        """
+        for prefix_len in range(len(_OPEN) - 1, 0, -1):
+            if buf.endswith(_OPEN[:prefix_len]):
+                return len(buf) - prefix_len
+        return len(buf)
+
+    def _safe_end_inside(buf: str) -> int:
+        """Return the index up to which it is safe to discard when inside a think block.
+
+        If ``buf`` ends with a partial prefix of ``</think>`` (e.g. ``</thi``),
+        that prefix is kept so the next chunk can complete the closing tag and
+        exit think mode correctly.
+        """
+        for prefix_len in range(len(_CLOSE) - 1, 0, -1):
+            if buf.endswith(_CLOSE[:prefix_len]):
+                return len(buf) - prefix_len
+        return len(buf)
 
     for chunk in stream:
         delta = chunk.choices[0].delta.content or ""
@@ -59,25 +88,31 @@ def _stream_hide_think(stream: Iterator) -> Generator[str, None, None]:
 
         while True:
             if not inside_think:
-                open_pos = buffer.find("<think>")
+                open_pos = buffer.find(_OPEN)
                 if open_pos == -1:
-                    # Nothing to suppress in current buffer — yield everything
-                    yield buffer
-                    buffer = ""
+                    # No complete open tag found — yield up to any partial tag prefix
+                    safe = _safe_end_outside(buffer)
+                    yield buffer[:safe]
+                    buffer = buffer[safe:]
                     break
-                # Yield text before the opening tag
+                # Yield text before the opening tag, then enter think mode
                 yield buffer[:open_pos]
-                buffer = buffer[open_pos + len("<think>"):]
+                buffer = buffer[open_pos + len(_OPEN):]
                 inside_think = True
             else:
-                close_pos = buffer.find("</think>")
+                close_pos = buffer.find(_CLOSE)
                 if close_pos == -1:
-                    # Still inside think block — discard and wait for more tokens
-                    buffer = ""
+                    # No complete close tag yet — discard up to any partial tag prefix
+                    safe = _safe_end_inside(buffer)
+                    buffer = buffer[safe:]
                     break
                 # Skip everything up to and including </think>
-                buffer = buffer[close_pos + len("</think>"):]
+                buffer = buffer[close_pos + len(_CLOSE):]
                 inside_think = False
+
+    # Flush any remaining safe content after the stream ends
+    if not inside_think and buffer:
+        yield buffer
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +229,7 @@ def iterative_explore(
     chunk_ids: list[str],
     toc: list[ToCEntry],
     client: OpenAI,
-) -> str:
+) -> Generator[str, None, None]:
     """Layer 3: Extract facts from each chosen chunk, then synthesise."""
     chunk_map = {e.chunk_id: e for e in toc}
     extracted_facts: list[str] = []
@@ -211,14 +246,15 @@ def iterative_explore(
                 extracted_facts.append(f"**[{cid}]** {facts}")
 
     if not extracted_facts:
-        return ""
+        return
 
     if len(extracted_facts) == 1:
-        return extracted_facts[0]
+        yield extracted_facts[0]
+        return
 
     # Multi-path: synthesise all extracted facts
     combined = "\n\n".join(extracted_facts)
-    return _synthesise(sub_queries, combined, client)
+    yield from _synthesise(sub_queries, combined, client)
 
 
 def _extract_facts(
@@ -280,10 +316,12 @@ def _find_parent(heading: str, toc: list[ToCEntry]) -> ToCEntry | None:
     return None
 
 
-def _synthesise(queries: list[str], facts: str, client: OpenAI) -> str:
-    """Final synthesis call to combine all extracted facts into a single answer."""
+def _synthesise(
+    queries: list[str], facts: str, client: OpenAI
+) -> Generator[str, None, None]:
+    """Final synthesis call — streams output, filtering out <think> blocks."""
     try:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=_MODEL,
             messages=[
                 {"role": "system", "content": _SYNTHESIS_SYSTEM},
@@ -297,11 +335,12 @@ def _synthesise(queries: list[str], facts: str, client: OpenAI) -> str:
             ],
             temperature=0.2,
             max_tokens=1024,
+            stream=True,
         )
-        return (response.choices[0].message.content or "").strip()
+        yield from _stream_hide_think(stream)
     except Exception as exc:
         logger.error("Synthesis error: %s", exc)
-        return facts  # Return raw facts as fallback
+        yield facts  # Yield raw facts as fallback
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +354,8 @@ content."
 """
 
 
-def bm25_fallback(query: str, toc: list[ToCEntry], client: OpenAI) -> str:
-    """Layer 4: BM25 lexical search → top hit → LLM grounded answer."""
+def bm25_fallback(query: str, toc: list[ToCEntry], client: OpenAI) -> Generator[str, None, None]:
+    """Layer 4: BM25 lexical search → top hit → LLM grounded answer (streamed)."""
     logger.info("Layer 4 triggered: BM25 fallback for query: %s", query)
 
     # Build corpus: combine first_sentence + last_sentence + raw_markdown for each entry
@@ -334,7 +373,7 @@ def bm25_fallback(query: str, toc: list[ToCEntry], client: OpenAI) -> str:
     logger.info("BM25 top hit: chunk_id=%s (score=%.4f)", best_entry.chunk_id, scores[best_idx])
 
     try:
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=_MODEL,
             messages=[
                 {"role": "system", "content": _BM25_GROUNDING_SYSTEM},
@@ -347,11 +386,12 @@ def bm25_fallback(query: str, toc: list[ToCEntry], client: OpenAI) -> str:
             ],
             temperature=0.1,
             max_tokens=512,
+            stream=True,
         )
-        return (response.choices[0].message.content or "").strip()
+        yield from _stream_hide_think(stream)
     except Exception as exc:
         logger.error("BM25 LLM call error: %s", exc)
-        return best_entry.raw_markdown[:1000]
+        yield best_entry.raw_markdown[:1000]
 
 
 def _tokenise(text: str) -> list[str]:
@@ -379,11 +419,13 @@ def retrieve(query: str, toc: list[ToCEntry]) -> Generator[str, None, None]:
 
     # Layer 3: Iterative exploration (if we have chunk hits)
     if chunk_ids:
-        answer = iterative_explore(sub_queries, chunk_ids, toc, client)
-        if answer:
-            yield answer
+        yielded_any = False
+        for chunk in iterative_explore(sub_queries, chunk_ids, toc, client):
+            if chunk:
+                yield chunk
+                yielded_any = True
+        if yielded_any:
             return
 
     # Layer 4: BM25 fallback
-    answer = bm25_fallback(query, toc, client)
-    yield answer
+    yield from bm25_fallback(query, toc, client)
