@@ -7,9 +7,7 @@ lxml>=4.9.0
 # Bloom Filter for deduplication
 pybloom-live>=4.0.0
 
-# Tokenisation (Qwen tokenizer only - no sentence-transformers)
-transformers>=4.37.0
-tokenizers>=0.15.0
+# Lightweight token estimation (no tokenizer model dependency)
 
 # LLM Client (local inference via llama.cpp)
 openai>=1.10.0
