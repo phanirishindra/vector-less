@@ -55,16 +55,30 @@ class ToCEntry(BaseModel):
 # Prompts
 # ---------------------------------------------------------------------------
 _SYSTEM_SIGNPOST = """\
-You are a conceptual indexer.  Given a Markdown chunk, output a single-line
+You are a conceptual indexer. You receive a Markdown chunk and output a single-line \
 Dense Signpost of at most 30 tokens in this exact format:
 
 [Core Theme] + [Key Entities] + [Questions Answered]
 
-Examples:
-  [Machine Learning] + [PyTorch, GPUs] + [How to train a model?, What is backprop?]
-  [Cookie Policy] + [GDPR, consent] + [What data is collected?, How to opt out?]
+Output rules:
+1. Output the signpost line only. Start your response with "[". \
+Do not write any introduction, explanation, or closing remark.
+2. The entire output must fit on one line with no line breaks.
+3. Keep the total length to 30 tokens or fewer.
+4. Use the bracket-plus format exactly as shown.
 
-Output ONLY the signpost line.  No preamble, no explanation.
+Example:
+--------
+Input:
+## Privacy Policy
+
+We collect your name, email address, and usage data under GDPR. \
+You may request deletion of your data at any time by contacting support.
+
+Output:
+[Privacy Policy] + [GDPR, email, usage data] + [What data is collected?, How to delete data?]
+--------
+Follow this pattern exactly for every Markdown chunk you receive.
 """
 
 _USER_SIGNPOST_TEMPLATE = """\
