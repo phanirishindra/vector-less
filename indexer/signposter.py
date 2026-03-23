@@ -17,7 +17,7 @@ import logging
 import pathlib
 from typing import Sequence
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from parser.chunker import MarkdownChunk
@@ -34,8 +34,8 @@ _MODEL = "qwen2.5"
 _DEFAULT_TOC_PATH = pathlib.Path("index/toc.json")
 
 
-def _build_client() -> OpenAI:
-    return OpenAI(base_url=_LOCAL_BASE_URL, api_key=_LOCAL_API_KEY)
+def _build_client() -> AsyncOpenAI:
+    return AsyncOpenAI(base_url=_LOCAL_BASE_URL, api_key=_LOCAL_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +77,10 @@ Markdown chunk:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def build_signpost(chunk: MarkdownChunk, client: OpenAI) -> str:
+async def build_signpost(chunk: MarkdownChunk, client: AsyncOpenAI) -> str:
     """Generate a Dense Signpost for a single chunk via the local LLM."""
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_SIGNPOST},
@@ -102,7 +102,7 @@ def build_signpost(chunk: MarkdownChunk, client: OpenAI) -> str:
         return ""
 
 
-def build_toc(
+async def build_toc(
     chunks: Sequence[MarkdownChunk],
     *,
     toc_path: pathlib.Path = _DEFAULT_TOC_PATH,
@@ -130,7 +130,7 @@ def build_toc(
         logger.info(
             "Signposting chunk %d/%d  [%s] …", i + 1, len(chunks), chunk.chunk_id
         )
-        signpost = build_signpost(chunk, client)
+        signpost = await build_signpost(chunk, client)
         entry = ToCEntry(
             chunk_id=chunk.chunk_id,
             dense_signpost=signpost,

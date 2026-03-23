@@ -106,32 +106,28 @@ async def crawl_and_index(request: CrawlRequest) -> CrawlResponse:
     if not results:
         raise HTTPException(status_code=422, detail="No pages could be crawled.")
 
-    # 2. Prune, split, translate, chunk (CPU-bound → run in thread pool)
+    # 2. Per-page: CPU-bound ops in thread pool, LLM calls awaited directly
     all_chunks: list[MarkdownChunk] = []
+    loop = asyncio.get_running_loop()
 
-    def _process_pages(pages: list[CrawlResult]) -> list[MarkdownChunk]:
-        chunks: list[MarkdownChunk] = []
-        for page in pages:
-            try:
-                pruned = prune(page.html)
-                html_parts = split_html(pruned)
-                markdown = translate_html_to_markdown(html_parts)
-                chunks.extend(chunk_markdown(markdown))
-            except Exception as exc:
-                logger.warning("Processing error for %s: %s", page.url, exc)
-        return chunks
-
-    all_chunks = await asyncio.get_event_loop().run_in_executor(
-        None, _process_pages, results
-    )
+    for page in results:
+        try:
+            # CPU-bound: prune and split run in thread pool to avoid blocking
+            pruned = await loop.run_in_executor(None, prune, page.html)
+            html_parts = await loop.run_in_executor(None, split_html, pruned)
+            # LLM inference: awaited directly (async network call, no threadpool)
+            markdown = await translate_html_to_markdown(html_parts)
+            # CPU-bound: chunking run in thread pool
+            chunks = await loop.run_in_executor(None, chunk_markdown, markdown)
+            all_chunks.extend(chunks)
+        except Exception as exc:
+            logger.warning("Processing error for %s: %s", page.url, exc)
 
     if not all_chunks:
         raise HTTPException(status_code=422, detail="No content could be extracted.")
 
-    # 3. Signpost and persist ToC
-    _toc = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: build_toc(all_chunks, toc_path=_TOC_PATH)
-    )
+    # 3. Signpost and persist ToC (awaited directly — async LLM calls)
+    _toc = await build_toc(all_chunks, toc_path=_TOC_PATH)
 
     return CrawlResponse(
         pages_crawled=len(results),
