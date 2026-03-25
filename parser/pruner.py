@@ -2,7 +2,7 @@
 HTML Pruner & Splitter
 ======================
 Strips boilerplate DOM elements and, when the remaining HTML exceeds 6 000 tokens
-(measured with the Qwen2.5-3B-Instruct tokenizer), splits it at a safe structural
+(estimated with a lightweight heuristic), splits it at a safe structural
 boundary so each piece can be processed individually by the LLM.
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-from functools import lru_cache
 from typing import Iterator
 
 from bs4 import BeautifulSoup, Tag
@@ -45,38 +44,14 @@ _SPLIT_BOUNDARIES: tuple[str, ...] = (
 )
 
 _TOKEN_LIMIT = 6_000
-_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer (lazy-loaded, cached)
+# Token counting (fast heuristic)
 # ---------------------------------------------------------------------------
-@lru_cache(maxsize=1)
-def _get_tokenizer():  # type: ignore[return]
-    """Load the Qwen tokenizer once and cache it for the process lifetime."""
-    try:
-        from transformers import AutoTokenizer  # type: ignore
-
-        tok = AutoTokenizer.from_pretrained(_MODEL_ID, use_fast=True)
-        logger.info("Loaded tokenizer: %s", _MODEL_ID)
-        return tok
-    except Exception as exc:
-        logger.warning(
-            "Could not load %s tokenizer (%s). "
-            "Falling back to whitespace-based token estimate.",
-            _MODEL_ID,
-            exc,
-        )
-        return None
-
-
 def _count_tokens(text: str) -> int:
-    tok = _get_tokenizer()
-    if tok is None:
-        # Rough approximation: 1 token ≈ 4 characters
-        return max(1, len(text) // 4)
-    ids = tok.encode(text, add_special_tokens=False)
-    return len(ids)
+    """Approximate token count: 1 token ≈ 4 characters."""
+    return max(1, len(text) // 4)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +101,7 @@ def prune(html: str) -> str:
 def split_html(html: str) -> list[str]:
     """
     If the pruned HTML is within the token budget, return it as a single-element
-    list.  Otherwise, split at structural boundaries and return multiple chunks,
+    list. Otherwise, split at structural boundaries and return multiple chunks,
     each within the limit.
     """
     if _count_tokens(html) <= _TOKEN_LIMIT:
@@ -192,6 +167,6 @@ def _split_at_boundaries(html: str) -> Iterator[str]:
 
 def _hard_split(html: str) -> list[str]:
     """Character-level hard split as last resort, respecting token budget."""
-    # Approx chars-per-token for Qwen: ~4
+    # Approx chars-per-token: ~4
     chars_per_chunk = _TOKEN_LIMIT * 4
     return [html[i : i + chars_per_chunk] for i in range(0, len(html), chars_per_chunk)]
