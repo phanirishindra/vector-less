@@ -196,14 +196,28 @@ def toc_route(
             max_tokens=256,
         )
         raw = (response.choices[0].message.content or "").strip()
-        chunk_ids: list[str] = json.loads(raw)
+
+        # 1) Fast path: exact JSON array
+        try:
+            chunk_ids = json.loads(raw)
+        except json.JSONDecodeError:
+            # 2) Fallback: extract first JSON array from mixed/prose/markdown output
+            match = re.search(r"\[[\s\S]*?\]", raw)
+            if not match:
+                logger.warning("ToC router returned non-JSON output: %r", raw[:300])
+                return []
+            try:
+                chunk_ids = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                logger.warning("ToC router JSON extraction failed: %r", raw[:300])
+                return []
+        
         if isinstance(chunk_ids, list):
             logger.info("ToC router selected %d chunk(s).", len(chunk_ids))
             return [str(c) for c in chunk_ids]
-    except Exception as exc:
-        logger.warning("ToC routing error: %s", exc)
-
-    return []
+        
+        logger.warning("ToC router output was not a list: %r", raw[:300])
+        return []
 
 
 # ---------------------------------------------------------------------------
