@@ -1,207 +1,116 @@
-"""
-FastAPI REST Interface for the Zero-Null Vectorless RAG System
-==============================================================
-Exposes endpoints to:
-  /crawl      – trigger crawl + index pipeline
-  /query      – run the multi-layer retrieval orchestrator (streamed SSE)
-  /toc        – inspect the current Table of Contents
-"""
-
 from __future__ import annotations
 
-import asyncio
-import logging
-import pathlib
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Iterator
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from crawler.crawler import Crawler, CrawlResult
-from indexer.signposter import ToCEntry, build_toc, load_toc
-from indexer.translator import translate_html_to_markdown
-from parser.chunker import MarkdownChunk, chunk_markdown
-from parser.pruner import prune, split_html
 from retrieval.orchestrator import retrieve
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+app = FastAPI(title="Vector-less RAG")
 
-_TOC_PATH = pathlib.Path("index/toc.json")
+ROOT = Path(__file__).resolve().parents[1]
+TOC_PATH = ROOT / "processed" / "toc.json"
 
-# Concurrency controls:
-# - _PAGE_CONCURRENCY limits total in-flight page processing tasks
-# - _LLM_CONCURRENCY limits concurrent LLM inference calls (protects llama.cpp)
-_PAGE_CONCURRENCY = 4
-_LLM_CONCURRENCY = 2
-
-# ---------------------------------------------------------------------------
-# Application state
-# ---------------------------------------------------------------------------
-_toc: list[ToCEntry] = []
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Load persisted ToC on startup if it exists."""
-    global _toc
-    if _TOC_PATH.exists():
-        try:
-            _toc = load_toc(_TOC_PATH)
-            logger.info("Loaded ToC with %d entries from disk.", len(_toc))
-        except Exception as exc:
-            logger.warning("Could not load ToC: %s", exc)
-    yield
-
-
-app = FastAPI(
-    title="Zero-Null Vectorless RAG",
-    description=(
-        "Crawl → Prune → Translate → Signpost → Retrieve pipeline "
-        "powered entirely by a local LLM (no vector embeddings)."
-    ),
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-
-# ---------------------------------------------------------------------------
-# Request / Response schemas
-# ---------------------------------------------------------------------------
-class CrawlRequest(BaseModel):
-    seed_urls: list[str]
-    max_pages: int = 50
-    same_origin_only: bool = True
-
-
-class CrawlResponse(BaseModel):
-    pages_crawled: int
-    chunks_indexed: int
-    toc_path: str
+_toc: str | None = None
 
 
 class QueryRequest(BaseModel):
     query: str
 
 
-class ToCResponse(BaseModel):
-    entries: list[dict]
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-@app.post("/crawl", response_model=CrawlResponse)
-async def crawl_and_index(request: CrawlRequest) -> CrawlResponse:
-    """
-    Crawl the given seed URLs, prune HTML, translate to Markdown via the local
-    LLM, chunk, signpost, and persist the ToC.
-    """
+@app.on_event("startup")
+def _startup() -> None:
     global _toc
+    _toc = TOC_PATH.read_text(encoding="utf-8")
 
-    # 1) Crawl
-    crawler = Crawler(
-        request.seed_urls,
-        max_pages=request.max_pages,
-        same_origin_only=request.same_origin_only,
-    )
-    results: list[CrawlResult] = await crawler.run()
-    if not results:
-        raise HTTPException(status_code=422, detail="No pages could be crawled.")
 
-    # 2) Per-page processing with bounded concurrency:
-    #    - CPU-bound ops in thread pool
-    #    - LLM ops awaited directly, guarded by semaphore
-    all_chunks: list[MarkdownChunk] = []
-    loop = asyncio.get_running_loop()
-    page_sem = asyncio.Semaphore(_PAGE_CONCURRENCY)
-    llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Vector-less RAG</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        max-width: 900px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      textarea {
+        width: 100%;
+        min-height: 120px;
+      }
+      pre {
+        white-space: pre-wrap;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 1rem;
+        min-height: 140px;
+      }
+      button {
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Vector-less RAG</h1>
+    <textarea id="q" placeholder="Ask a question..."></textarea>
+    <br />
+    <button id="ask">Ask</button>
+    <h3>Answer</h3>
+    <pre id="out"></pre>
 
-    async def _process_page(page: CrawlResult) -> list[MarkdownChunk]:
-        async with page_sem:
-            try:
-                # CPU-bound: prune and split in thread pool
-                pruned = await loop.run_in_executor(None, prune, page.html)
-                html_parts = await loop.run_in_executor(None, split_html, pruned)
+    <script>
+      const askBtn = document.getElementById("ask");
+      const out = document.getElementById("out");
+      const q = document.getElementById("q");
 
-                # LLM inference: awaited directly (async), with bounded concurrency
-                async with llm_sem:
-                    markdown = await translate_html_to_markdown(html_parts)
+      askBtn.onclick = async () => {
+        out.textContent = "";
+        const res = await fetch("/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q.value }),
+        });
 
-                # CPU-bound: chunking in thread pool
-                chunks = await loop.run_in_executor(None, chunk_markdown, markdown)
-                return chunks
-            except Exception as exc:
-                logger.warning("Processing error for %s: %s", page.url, exc)
-                return []
+        if (!res.ok || !res.body) {
+          out.textContent = `Request failed: ${res.status}`;
+          return;
+        }
 
-    page_chunk_lists = await asyncio.gather(
-        *(_process_page(page) for page in results),
-        return_exceptions=False,
-    )
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
 
-    for chunks in page_chunk_lists:
-        all_chunks.extend(chunks)
-
-    if not all_chunks:
-        raise HTTPException(status_code=422, detail="No content could be extracted.")
-
-    # 3) Signpost and persist ToC (awaited directly — async LLM calls)
-    _toc = await build_toc(all_chunks, toc_path=_TOC_PATH)
-
-    return CrawlResponse(
-        pages_crawled=len(results),
-        chunks_indexed=len(_toc),
-        toc_path=str(_TOC_PATH),
-    )
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          out.textContent += decoder.decode(value, { stream: true });
+        }
+        out.textContent += decoder.decode();
+      };
+    </script>
+  </body>
+</html>
+"""
 
 
 @app.post("/query")
-async def query_rag(request: QueryRequest) -> StreamingResponse:
+def query(request: QueryRequest) -> StreamingResponse:
     """
-    Run the multi-layer retrieval orchestrator and stream the answer back
-    using Server-Sent Events. The <think> scratchpad is never surfaced.
+    QUICK FIX (Option A):
+    Use a synchronous generator so Starlette/FastAPI can execute streaming work
+    in a threadpool, preventing the main event loop from being blocked by
+    synchronous network calls inside retrieval.orchestrator.retrieve().
     """
-    if not _toc:
-        raise HTTPException(
-            status_code=503,
-            detail="No indexed content available. POST /crawl first.",
-        )
 
-    async def _generate() -> AsyncIterator[str]:
+    def _generate() -> Iterator[str]:
         for token in retrieve(request.query, _toc):
             yield token
-        yield "\n"
 
     return StreamingResponse(_generate(), media_type="text/plain")
-
-
-@app.get("/toc", response_model=ToCResponse)
-async def get_toc() -> ToCResponse:
-    """Return the current in-memory Table of Contents (signposts only)."""
-    return ToCResponse(
-        entries=[
-            {
-                "chunk_id": e.chunk_id,
-                "dense_signpost": e.dense_signpost,
-                "first_sentence": e.first_sentence,
-                "last_sentence": e.last_sentence,
-            }
-            for e in _toc
-        ]
-    )
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "toc_entries": len(_toc)}
-
-
-# ---------------------------------------------------------------------------
-# Dev runner
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8080, reload=True)
