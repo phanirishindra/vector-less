@@ -218,6 +218,10 @@ def toc_route(
         
         logger.warning("ToC router output was not a list: %r", raw[:300])
         return []
+  
+  except Exception as exc:
+        logger.warning("ToC routing error: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
