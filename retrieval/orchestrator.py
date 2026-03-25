@@ -149,13 +149,23 @@ def deepsieve(query: str, client: OpenAI) -> list[str]:
     raw = "".join(visible_tokens).strip()
 
     try:
-        sub_queries: list[str] = json.loads(raw)
-        if isinstance(sub_queries, list) and sub_queries:
-            logger.info("DeepSieve produced %d sub-quer(ies).", len(sub_queries))
-            return [str(q) for q in sub_queries]
+        sub_queries = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("DeepSieve JSON parse error; using original query.")
+        # Fallback: extract JSON array from markdown
+        match = re.search(r"\[[\s\S]*?\]", raw)
+        if match:
+            try:
+                sub_queries = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                sub_queries = None
+        else:
+            sub_queries = None
 
+    if isinstance(sub_queries, list) and sub_queries:
+        logger.info("DeepSieve produced %d sub-quer(ies).", len(sub_queries))
+        return [str(q) for q in sub_queries]
+    
+    logger.warning("DeepSieve JSON parse error; using original query.")
     return [query]
 
 
