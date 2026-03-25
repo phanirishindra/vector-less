@@ -45,7 +45,7 @@ async def main(seed_urls: list[str], query: str, max_pages: int) -> None:
         try:
             pruned = prune(page.html)
             parts = split_html(pruned)
-            markdown = translate_html_to_markdown(parts)
+            markdown = await translate_html_to_markdown(parts)
             all_chunks.extend(chunk_markdown(markdown))
         except Exception as exc:
             logger.warning("Skipping %s: %s", page.url, exc)
@@ -58,7 +58,7 @@ async def main(seed_urls: list[str], query: str, max_pages: int) -> None:
     # ------------------------------------------------------------------ Step 3
     logger.info("Step 3/4 – Building Dense Signposts and ToC …")
     toc_path = pathlib.Path("index/toc.json")
-    toc = build_toc(all_chunks, toc_path=toc_path)
+    toc = await build_toc(all_chunks, toc_path=toc_path)
     logger.info("ToC written to %s", toc_path)
 
     # ------------------------------------------------------------------ Step 4
