@@ -8,6 +8,8 @@ lxml>=4.9.0
 pybloom-live>=4.0.0
 
 # Lightweight token estimation (no tokenizer model dependency)
+#pip uninstall -y transformers tokenizers huggingface-hub safetensors ( no need to run this)
+
 
 # LLM Client (local inference via llama.cpp)
 openai>=1.10.0
