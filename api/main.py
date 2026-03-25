@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -16,6 +16,7 @@ app = FastAPI(title="Vector-less RAG")
 ROOT = Path(__file__).resolve().parents[1]
 TOC_PATH = ROOT / "processed" / "toc.json"
 
+# Keep objects with attribute access (e.chunk_id, etc.) for orchestrator compatibility.
 _toc: list[SimpleNamespace] = []
 
 
@@ -28,7 +29,10 @@ def _startup() -> None:
     global _toc
     raw = TOC_PATH.read_text(encoding="utf-8")
     data = json.loads(raw)
-    # Convert dict rows to objects so orchestrator's e.chunk_id-style access works.
+
+    if not isinstance(data, list):
+        raise ValueError(f"Expected TOC JSON array in {TOC_PATH}, got {type(data).__name__}")
+
     _toc = [SimpleNamespace(**row) for row in data]
 
 
@@ -106,9 +110,9 @@ def index() -> str:
 
 
 @app.post("/query")
-def query(request: QueryRequest) -> StreamingResponse:
-    def _generate() -> Iterator[str]:
-        for token in retrieve(request.query, _toc):
+async def query(request: QueryRequest) -> StreamingResponse:
+    async def _generate() -> AsyncIterator[str]:
+        async for token in retrieve(request.query, _toc):
             yield token
 
     return StreamingResponse(_generate(), media_type="text/plain")
