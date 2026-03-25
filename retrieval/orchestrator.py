@@ -248,10 +248,6 @@ def iterative_explore(
     if not extracted_facts:
         return
 
-    if len(extracted_facts) == 1:
-        yield extracted_facts[0]
-        return
-
     # Multi-path: synthesise all extracted facts
     combined = "\n\n".join(extracted_facts)
     yield from _synthesise(sub_queries, combined, client)
