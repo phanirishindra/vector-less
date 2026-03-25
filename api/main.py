@@ -18,7 +18,7 @@ from typing import AsyncIterator
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 from crawler.crawler import Crawler, CrawlResult
 from indexer.signposter import ToCEntry, build_toc, load_toc
@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 _TOC_PATH = pathlib.Path("index/toc.json")
+
+# Concurrency controls:
+# - _PAGE_CONCURRENCY limits total in-flight page processing tasks
+# - _LLM_CONCURRENCY limits concurrent LLM inference calls (protects llama.cpp)
+_PAGE_CONCURRENCY = 4
+_LLM_CONCURRENCY = 2
 
 # ---------------------------------------------------------------------------
 # Application state
@@ -96,7 +102,7 @@ async def crawl_and_index(request: CrawlRequest) -> CrawlResponse:
     """
     global _toc
 
-    # 1. Crawl
+    # 1) Crawl
     crawler = Crawler(
         request.seed_urls,
         max_pages=request.max_pages,
@@ -106,27 +112,44 @@ async def crawl_and_index(request: CrawlRequest) -> CrawlResponse:
     if not results:
         raise HTTPException(status_code=422, detail="No pages could be crawled.")
 
-    # 2. Per-page: CPU-bound ops in thread pool, LLM calls awaited directly
+    # 2) Per-page processing with bounded concurrency:
+    #    - CPU-bound ops in thread pool
+    #    - LLM ops awaited directly, guarded by semaphore
     all_chunks: list[MarkdownChunk] = []
     loop = asyncio.get_running_loop()
+    page_sem = asyncio.Semaphore(_PAGE_CONCURRENCY)
+    llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
 
-    for page in results:
-        try:
-            # CPU-bound: prune and split run in thread pool to avoid blocking
-            pruned = await loop.run_in_executor(None, prune, page.html)
-            html_parts = await loop.run_in_executor(None, split_html, pruned)
-            # LLM inference: awaited directly (async network call, no threadpool)
-            markdown = await translate_html_to_markdown(html_parts)
-            # CPU-bound: chunking run in thread pool
-            chunks = await loop.run_in_executor(None, chunk_markdown, markdown)
-            all_chunks.extend(chunks)
-        except Exception as exc:
-            logger.warning("Processing error for %s: %s", page.url, exc)
+    async def _process_page(page: CrawlResult) -> list[MarkdownChunk]:
+        async with page_sem:
+            try:
+                # CPU-bound: prune and split in thread pool
+                pruned = await loop.run_in_executor(None, prune, page.html)
+                html_parts = await loop.run_in_executor(None, split_html, pruned)
+
+                # LLM inference: awaited directly (async), with bounded concurrency
+                async with llm_sem:
+                    markdown = await translate_html_to_markdown(html_parts)
+
+                # CPU-bound: chunking in thread pool
+                chunks = await loop.run_in_executor(None, chunk_markdown, markdown)
+                return chunks
+            except Exception as exc:
+                logger.warning("Processing error for %s: %s", page.url, exc)
+                return []
+
+    page_chunk_lists = await asyncio.gather(
+        *(_process_page(page) for page in results),
+        return_exceptions=False,
+    )
+
+    for chunks in page_chunk_lists:
+        all_chunks.extend(chunks)
 
     if not all_chunks:
         raise HTTPException(status_code=422, detail="No content could be extracted.")
 
-    # 3. Signpost and persist ToC (awaited directly — async LLM calls)
+    # 3) Signpost and persist ToC (awaited directly — async LLM calls)
     _toc = await build_toc(all_chunks, toc_path=_TOC_PATH)
 
     return CrawlResponse(
@@ -140,12 +163,12 @@ async def crawl_and_index(request: CrawlRequest) -> CrawlResponse:
 async def query_rag(request: QueryRequest) -> StreamingResponse:
     """
     Run the multi-layer retrieval orchestrator and stream the answer back
-    using Server-Sent Events.  The <think> scratchpad is never surfaced.
+    using Server-Sent Events. The <think> scratchpad is never surfaced.
     """
     if not _toc:
         raise HTTPException(
             status_code=503,
-            detail="No indexed content available.  POST /crawl first.",
+            detail="No indexed content available. POST /crawl first.",
         )
 
     async def _generate() -> AsyncIterator[str]:
