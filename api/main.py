@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 
 from fastapi import FastAPI
@@ -14,7 +16,7 @@ app = FastAPI(title="Vector-less RAG")
 ROOT = Path(__file__).resolve().parents[1]
 TOC_PATH = ROOT / "processed" / "toc.json"
 
-_toc: str | None = None
+_toc: list[SimpleNamespace] = []
 
 
 class QueryRequest(BaseModel):
@@ -24,7 +26,10 @@ class QueryRequest(BaseModel):
 @app.on_event("startup")
 def _startup() -> None:
     global _toc
-    _toc = TOC_PATH.read_text(encoding="utf-8")
+    raw = TOC_PATH.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    # Convert dict rows to objects so orchestrator's e.chunk_id-style access works.
+    _toc = [SimpleNamespace(**row) for row in data]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -102,13 +107,6 @@ def index() -> str:
 
 @app.post("/query")
 def query(request: QueryRequest) -> StreamingResponse:
-    """
-    QUICK FIX (Option A):
-    Use a synchronous generator so Starlette/FastAPI can execute streaming work
-    in a threadpool, preventing the main event loop from being blocked by
-    synchronous network calls inside retrieval.orchestrator.retrieve().
-    """
-
     def _generate() -> Iterator[str]:
         for token in retrieve(request.query, _toc):
             yield token
